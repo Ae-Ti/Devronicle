@@ -1,0 +1,81 @@
+package com.worklog.vscode;
+
+import com.worklog.auth.AuthenticatedUser;
+import com.worklog.auth.DataScope;
+import com.worklog.config.ApiException;
+import jakarta.validation.Valid;
+import java.time.LocalDate;
+import java.util.List;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * VS Code 확장 수신·조회 (PRD 7. /vscode/sessions).
+ *
+ * <p>POST 는 SecurityConfig 에서 {@code X-Api-Key} 로만 열려 있다. JWT 로 부르면 403 이 나므로
+ * 컨트롤러에는 별도 설정이 없다. GET 은 대시보드가 쓰는 ★ 경로라 두 수단 모두 받는다.
+ */
+@RestController
+@RequestMapping("/vscode/sessions")
+public class VscodeSessionController {
+
+    private final VscodeSessionService service;
+    private final AiSessionSummarizer summarizer;
+
+    public VscodeSessionController(VscodeSessionService service, AiSessionSummarizer summarizer) {
+        this.service = service;
+        this.summarizer = summarizer;
+    }
+
+    @PostMapping
+    public UpsertResponse upsert(
+            @AuthenticationPrincipal AuthenticatedUser principal, @RequestBody @Valid SessionRequest request) {
+        Long id = service.upsert(principal.id(), request).getId();
+        // 아직 요약이 없는 대화만 뒤에서 채운다. 확장의 전송을 기다리게 하지 않는다 —
+        // LLM 이 느리거나 죽어 있어도 수집은 제 시간에 끝나야 한다.
+        summarizer.summarizeMissing(id);
+        return new UpsertResponse(id);
+    }
+
+    /**
+     * 세션 목록. {@code date} 하나를 주면 그날, {@code from}·{@code to} 를 주면 그 기간이다.
+     *
+     * <p>기간 조회는 VSCode 내역 화면이 쓴다 — 날짜 선택기로 하루씩 넘기지 않고 달 단위로
+     * 본다 (BACKLOG2 §2-3). {@code GET /drafts} 와 같은 규칙이라 부르는 쪽이 헷갈리지 않는다.
+     * 기존 호출부는 {@code date} 를 그대로 쓰면 된다.
+     *
+     * <p>{@code mine=true} 는 <b>부르는 사람 자신</b>의 것만 준다. VS Code 확장이 쓴다 —
+     * 확장은 API Key 만 들고 있어 제 {@code userId} 를 모르는데, 빼고 부르면 그날 팀 전원의
+     * 기록이 내려간다.
+     */
+    @GetMapping
+    public List<SessionResponse> list(
+            @AuthenticationPrincipal AuthenticatedUser principal,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @RequestParam(required = false) Long userId,
+            @RequestParam(defaultValue = "false") boolean mine) {
+        if (date == null && (from == null || to == null)) {
+            throw ApiException.badRequest("DATE_REQUIRED", "date 또는 from·to 를 함께 주어야 합니다.");
+        }
+        // mine=true 는 "내 것만" 을 명시하는 지름길이다 (담당자 1). 범위 판단 자체는 DataScope
+        // 한 곳에 맡긴다 — MEMBER 는 어차피 자기 것으로 좁혀지고, 미커밋 diff 본문이
+        // 통째로 나가던 자리라 서버에서 막아야 한다.
+        Long requested = mine ? (principal == null ? null : principal.id()) : userId;
+        Long owner = DataScope.userIdFor(principal, requested);
+        List<VscodeSession> found = date == null
+                ? service.findBetween(from, to, owner)
+                : service.findForDay(date, owner);
+        return found.stream().map(SessionResponse::from).toList();
+    }
+
+    /** PRD 7. — 200 {id}. */
+    public record UpsertResponse(Long id) {}
+}

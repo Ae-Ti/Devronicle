@@ -1,0 +1,319 @@
+/**
+ * PRD 7. API 명세의 응답 타입. 목업 JSON(`src/mocks/`)과 실서버 응답이 같은 모양이어야 하므로
+ * 필드명을 임의로 바꾸지 않는다. 목록은 배열, `/activities` 만 페이지 래퍼를 쓴다
+ * (docs/HANDOFF_day1_integration.md 2.).
+ */
+
+export type ActivityType = 'COMMIT' | 'PR_OPENED' | 'PR_MERGED'
+export type SummaryStatus = 'PENDING' | 'DONE' | 'FAILED'
+export type DraftStatus = 'DRAFT' | 'CONFIRMED'
+export type SyncStatus = 'OK' | 'SYNCING' | 'FAILED'
+
+export interface Me {
+  id: number
+  /** GitHub 로그인. 연동하지 않았으면 빈 문자열이다 (사원번호 로그인으로 바뀐 뒤). */
+  login: string
+  name: string | null
+  avatarUrl: string | null
+  /** 사원번호 네 자리. 회원 조회 API 의 empSeq 를 채운 값 (9/10 회의). */
+  loginId?: string
+  role?: 'MEMBER' | 'ADMIN'
+  mustChangePassword?: boolean
+  /**
+   * 관리자 콘솔 말고는 볼 것이 없는 계정 (9/11).
+   *
+   * <p>사원도 아니고 GitHub 도 붙어 있지 않아 일반 화면에 보여 줄 기록이 하나도 없다.
+   * 관리자를 **겸하는 팀원**은 자기 기록이 있으므로 이 값이 false 다.
+   */
+  consoleOnly?: boolean
+}
+
+export interface UserRef extends Me {}
+
+/**
+ * `POST /auth/login` — 사원번호와 비밀번호로 로그인한다 (9/10 회의).
+ * 관리자 콘솔도 같은 경로를 쓰고 `role` 로 갈린다.
+ */
+export interface LoginRequest {
+  /** 사원번호 네 자리 (예: 0042). 관리자는 admin */
+  loginId: string
+  password: string
+}
+
+export interface LoginResponse {
+  token: string
+  /** true 면 비밀번호를 바꾸기 전까지 다른 화면으로 갈 수 없다. */
+  mustChangePassword: boolean
+  role: 'MEMBER' | 'ADMIN'
+}
+
+/** `GET /me/github` — 내 계정에 붙은 GitHub. 붙이지 않았으면 linked=false. */
+export interface GithubLink {
+  linked: boolean
+  login: string | null
+  avatarUrl: string | null
+  linkedAt: string | null
+}
+
+export interface RepoRef {
+  id: number
+  fullName: string
+}
+
+export interface Repo {
+  id: number
+  fullName: string
+  defaultBranch: string | null
+  lastSyncedAt: string | null
+  registeredBy: { id: number; login: string }
+  /** 그날 이 리포의 커밋 수 — 리포 관리 Table "오늘 활동 수" */
+  todayActivityCount: number
+  syncStatus: SyncStatus
+}
+
+export interface Activity {
+  id: number
+  type: ActivityType
+  repo: RepoRef
+  /** 가입하지 않은 GitHub 계정의 활동은 null 이고 externalLogin 만 채워진다 (PRD F1-5). */
+  user: UserRef | null
+  externalLogin: string | null
+  /** COMMIT 은 sha, PR_OPENED/PR_MERGED 는 PR 번호 */
+  externalId: string
+  sha: string | null
+  title: string
+  url: string
+  branch: string | null
+  filesChanged: number | null
+  additions: number | null
+  deletions: number | null
+  summary: string | null
+  summaryStatus: SummaryStatus
+  occurredAt: string
+}
+
+export interface Page<T> {
+  items: T[]
+  page: number
+  size: number
+  total: number
+}
+
+/** `GET /activities/{id}` — 목록 항목에 커밋 메시지와 diff 본문을 더한다. */
+export interface ActivityDetail extends Activity {
+  message: string | null
+  /** 수집기가 아직 채우지 않아 항상 null 이다 (TODO_0910 §4 F-2). */
+  rawDiff: string | null
+}
+
+export interface UncommittedFile {
+  path: string
+  additions: number
+  deletions: number
+  diff?: string
+}
+
+export interface TodoItem {
+  path: string
+  line: number
+  text: string
+}
+
+export interface EditTimelineEntry {
+  path: string
+  firstSavedAt: string
+  lastSavedAt: string
+  saveCount: number
+}
+
+/** 그 폴더에서 오간 AI 대화 한 세션 (V10 — 제목과 질의별 답변이 생겼다). */
+export interface AiSessionSummary {
+  id: string
+  /** Claude Code 가 남긴 세션 제목. 없는 세션은 첫 질문에서 만든다. */
+  title: string
+  firstAt: string
+  lastAt: string
+  /** 그날 실제로 물어본 횟수. `turns` 는 잘려도 이 값은 전부 센다 (C-1 ①). */
+  promptCount: number
+  turns: AiTurn[]
+  /**
+   * 이 대화가 무엇이었는지 서버가 LLM 으로 적은 두어 문장.
+   *
+   * <p>전송 직후 뒤에서 채우므로 방금 올라온 대화에는 잠깐 없다. 질문이 늘면 다시 만든다.
+   */
+  summary?: string | null
+}
+
+/**
+ * 고쳐 놓고 저장하지 않은 파일 하나.
+ *
+ * <p>예전에는 저장 이벤트(파일별 저장 횟수)를 모았다. 그런데 VS Code 의 저장 이벤트는
+ * 편집기에서 저장할 때만 와서, 파일을 디스크에 곧바로 쓰는 AI 도구의 변경은 한 건도
+ * 남지 않았다 — 사람이 손으로 저장한 것만 모으는 목록이었다.
+ */
+export interface UnsavedFile {
+  path: string
+  /** 고치기 시작해 저장하지 않은 채 지난 시각. 확장을 다시 켠 뒤면 없다. */
+  dirtySince?: string | null
+}
+
+/** 미푸시 커밋 하나. GitHub 활동으로는 잡히지 않는다 — 원격에 없으니 API 에 안 나온다. */
+export interface UnpushedCommit {
+  /** 짧은 해시 */
+  sha: string
+  subject: string
+  at: string
+}
+
+/** 질문 하나와 그에 대한 답변. 답변은 확장이 앞부분만 잘라 보낸다. */
+export interface AiTurn {
+  at: string
+  prompt: string
+  answer?: string | null
+}
+
+export interface VscodeSession {
+  id: number
+  userId: number
+  repo: RepoRef | null
+  remoteUrl: string
+  branch: string
+  workDate: string
+  uncommittedFiles: UncommittedFile[]
+  todos: TodoItem[]
+  planNote: string | null
+  /** 파일별 저장 이벤트. 2026-09-11 이전 기록에만 들어 있다 — 지금은 `unsavedFiles` 를 모은다. */
+  editTimeline: EditTimelineEntry[]
+  /** 고쳐 놓고 아직 저장하지 않은 파일. git 에 잡히지 않는 유일한 구간이다. */
+  unsavedFiles?: UnsavedFile[]
+  /** 커밋에도 미커밋 변경에도 남지 않는 작업의 단서. */
+  aiSessions: AiSessionSummary[]
+  /**
+   * 커밋했지만 아직 push 하지 않은 커밋 (V11).
+   *
+   * <p>`null` 은 <b>셀 수 없음</b>이다 — 한 번도 push 하지 않은 브랜치는 비교할 업스트림이
+   * 없다. 빈 배열(미푸시 없음)과 뜻이 다르므로 화면에서도 나눠 적는다.
+   */
+  unpushedCommits?: UnpushedCommit[] | null
+  summary: string | null
+  lastCommitAt: string | null
+  reportedAt: string
+}
+
+/** `GET /drafts` — 목록에는 본문을 싣지 않는다. */
+export interface DraftSummary {
+  id: number
+  userId: number
+  workDate: string
+  version: number
+  status: DraftStatus
+  createdAt: string
+  updatedAt: string
+  confirmedAt: string | null
+  /** 18:00 스케줄러가 만든 초안인지. 사용자가 버튼을 눌러 만들었으면 false. */
+  autoGenerated: boolean
+  /** 사용자가 저장한 적이 있는지. 있으면 스케줄러가 덮지 않는다. */
+  userEdited: boolean
+  /** DAILY 하루치 · WEEKLY 주간 · REPO 저장소별 (V15). */
+  kind: DraftKind
+  /** WEEKLY·REPO 의 기간. DAILY 는 null 이고 workDate 하루가 곧 기간이다. */
+  periodStart: string | null
+  periodEnd: string | null
+  repoId: number | null
+  repoFullName: string | null
+}
+
+export type DraftKind = 'DAILY' | 'WEEKLY' | 'REPO'
+
+/** `GET /drafts/{id}` — 근거를 객체로 펼친 상세. */
+export interface Draft extends DraftSummary {
+  contentMd: string
+  sourceActivities: Activity[]
+  sourceSessions: VscodeSession[]
+}
+
+/**
+ * `POST /drafts/generate` 응답. 상세(Draft)와 **모양이 다르다** — 근거가 객체가 아니라 id 배열이고
+ * 타임스탬프가 없다. 상세 캐시에 그대로 넣으면 화면이 sourceActivities 를 못 찾아 터진다.
+ */
+export interface GeneratedDraft {
+  id: number
+  userId: number
+  workDate: string
+  version: number
+  status: DraftStatus
+  contentMd: string
+  sourceActivityIds: number[]
+  sourceSessionIds: number[]
+}
+
+export interface DailyStats {
+  date: string
+  commits: number
+  prs: number
+  merges: number
+  sessions: number
+  /** "어제 대비 +3" */
+  commitsDelta: number
+  /** "⚠ 6시간 이상 1건" */
+  staleSessions: number
+  /**
+   * 사용자에 연결되지 않은 활동 수. 총계 = byUser 합계 + unmapped 가 항상 성립한다.
+   * 가입하지 않은 외부 기여자의 커밋이 여기 잡힌다.
+   */
+  unmapped: { commits: number; prs: number; merges: number }
+  byUser: { userId: number; commits: number; prs: number; merges: number; sessions: number }[]
+}
+
+export interface PeopleSeriesPoint {
+  date: string
+  commits: number
+  prs: number
+  merges: number
+  draft: { id: number; status: DraftStatus } | null
+}
+
+export interface PeopleStats {
+  from: string
+  to: string
+  granularity: 'day' | 'week'
+  items: {
+    user: UserRef
+    totals: { commits: number; prs: number; merges: number }
+    series: PeopleSeriesPoint[]
+  }[]
+}
+
+export interface ApiKey {
+  id: number
+  label: string
+  createdAt: string
+  lastUsedAt: string | null
+}
+
+/**
+ * 발급 직후 한 번만 평문 키가 온다. 목록 항목(ApiKey)과 달리 `lastUsedAt` 이 없다 —
+ * 방금 만든 키라 사용 이력이 있을 수 없다. 상속하면 타입이 실제 응답을 속인다.
+ */
+export interface IssuedApiKey {
+  id: number
+  label: string
+  key: string
+  createdAt: string
+}
+
+export interface NotifySettings {
+  mattermostWebhookUrl: string | null
+  remindUncommitted: boolean
+}
+
+export interface LlmSettings {
+  provider: 'gemma4' | 'qwen3'
+  presets: { id: 'gemma4' | 'qwen3'; model: string; connected: boolean }[]
+}
+
+/** 오류 형식은 전부 이 모양이다 (HANDOFF 3.). */
+export interface ApiErrorBody {
+  code: string
+  message: string
+}

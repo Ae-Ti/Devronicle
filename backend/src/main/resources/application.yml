@@ -1,0 +1,115 @@
+spring:
+  application:
+    name: worklog-backend
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5433/worklog}
+    username: ${DB_USER:worklog}
+    password: ${DB_PASSWORD:worklog}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: Asia/Seoul
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  jackson:
+    time-zone: Asia/Seoul
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  port: 8080
+  servlet:
+    # PRD 7. 모든 API는 /api prefix 아래에 놓인다.
+    context-path: /api
+
+worklog:
+  # 콜백 뒤 돌아갈 화면 주소의 기본값. 요청의 Origin 이 사내망 대역이면 그쪽으로 돌아가므로
+  # (BACKLOG2 §2-1), 이 값은 Origin 을 못 얻었을 때와 Mattermost 메시지의 링크에 쓰인다.
+  frontend-url: ${FRONTEND_URL:http://localhost:5173}
+  # 여럿이 한 서버를 볼 때만 채운다. 비우면 요청에서 만든다 — 프록시를 지나면 localhost 로
+  # 보여서 GitHub 이 각자의 PC 로 돌려보낸다 (BACKLOG2 §2-1).
+  # OAuth App 에 등록한 콜백 주소와 글자까지 같아야 한다.
+  oauth-redirect-uri: ${WORKLOG_OAUTH_REDIRECT_URI:}
+
+  # 관리자 콘솔에 들어갈 수 있는 GitHub 로그인 (쉼표 구분).
+  # 개인 GitHub 계정에 관리자 권한을 얹는 방식이라, 아래 admin 계정이 있으면 비워 두는 편이 낫다.
+  admin-logins: ${WORKLOG_ADMIN_LOGINS:}
+
+  # GitHub 과 무관한 관리자 계정. 기동 시 없으면 만든다. 이미 있으면 손대지 않는다.
+  admin:
+    login-id: ${WORKLOG_ADMIN_ID:admin}
+    initial-password: ${WORKLOG_ADMIN_PASSWORD:admin1234}
+
+  # 사내 회원 조회 API (TODO_0910 1-1). 사내망 주소와 키라 backend/.env 에만 둔다.
+  # 설정이 없으면 관리자 콘솔의 직원 목록만 비고 나머지는 그대로 뜬다.
+  directory:
+    base-url: ${DIRECTORY_API_BASE_URL:}
+    api-key: ${DIRECTORY_API_KEY:}
+    # 회사가 둘인데 이름이 같다. 사원 목록이 겹치지 않으며 실제 회사는 29 다 (9/10 확인).
+    company-seq: ${DIRECTORY_COMPANY_SEQ:29}
+    # 사내 API 가 없을 때 쓰는 임시 사원 목록 (형식: 9999:이름,9998:이름).
+    # 진짜 API 가 붙으면 쓰이지 않는다. 연동이 끝나면 이 줄과 함께 지운다.
+    fallback-employees: ${DIRECTORY_FALLBACK_EMPLOYEES:}
+
+  # 2-2 / 2-3 (오후 작업)에서 사용
+  jwt:
+    secret: ${JWT_SECRET:}
+    ttl-hours: 12
+  encryption:
+    key: ${ENCRYPTION_KEY:}
+
+  github:
+    client-id: ${GITHUB_CLIENT_ID:}
+    client-secret: ${GITHUB_CLIENT_SECRET:}
+    # OAuth App 에 등록한 콜백 주소. 비우면 요청 URL 로 만든다 (프록시 뒤에서는 localhost 가 된다).
+    redirect-uri: ${GITHUB_REDIRECT_URI:}
+    scope: read:user repo
+    sync-cron: ${GITHUB_SYNC_CRON:0 */10 * * * *}
+
+  draft:
+    schedule-cron: ${DRAFT_SCHEDULE_CRON:0 0 18 * * *}
+
+  notify:
+    mattermost-webhook-url: ${MATTERMOST_WEBHOOK_URL:}
+    # 미커밋 리마인드 (F7-2). 업무 시간에 매시 정각.
+    remind-cron: ${WORKLOG_REMIND_CRON:0 0 10-18 * * *}
+  # 채널에서 "OOO의 오늘 업무일지 요약해줘" 로 물으면 답하기. 두 길이 있다.
+  chat:
+    # (1) Outgoing Webhook — Mattermost 관리자가 켜 줘야 한다. 요청마다 오는 token.
+    mattermost-token: ${MATTERMOST_OUTGOING_TOKEN:}
+    # (2) 봇 계정 — 일반 회원 계정 하나로 된다. 우리가 로그인해 채널을 읽고 답을 쓴다.
+    bot:
+      base-url: ${MATTERMOST_BASE_URL:}
+      login-id: ${MATTERMOST_BOT_LOGIN_ID:}
+      password: ${MATTERMOST_BOT_PASSWORD:}
+      poll-interval-ms: ${MATTERMOST_BOT_POLL_MS:3000}
+
+  # PRD F2. 구현체는 OpenAiCompatProvider 하나이고, 모델은 프리셋으로만 추가한다.
+  llm:
+    provider: ${WORKLOG_LLM_PROVIDER:mock}
+    # 요약 파이프라인 주기. 수집 직후 대시보드에 바로 뜨도록 짧게 잡는다.
+    summary-interval-ms: ${WORKLOG_SUMMARY_INTERVAL_MS:60000}
+    presets:
+      gemma4:
+        base-url: "http://llm.internal:18000/v1"
+        model: "google/gemma-4-26b-a4b-qat"
+        api-key: "${GEMMA4_API_KEY:}"
+      qwen3:
+        base-url: "http://llm.internal:11435/v1"
+        model: "qwen3.8:27b"
+        api-key: "${QWEN3_API_KEY:}"
+        # 실측 결과 3,000자 diff 한 건에 50초 이상 걸린다. PRD F2 의 기본 60초로는
+        # 큰 커밋이 매번 타임아웃으로 실패한다.
+        timeout-seconds: 180
+
+logging:
+  level:
+    com.worklog: DEBUG

@@ -1,0 +1,462 @@
+import * as path from 'node:path'
+import * as vscode from 'vscode'
+import { sourceOfId } from './aiSessions'
+import { todayKst } from './collector'
+import type { Collector } from './collector'
+import { repoFullName } from './git'
+import type { UnpushedCommit } from './git'
+import { cachedRegisteredRepos, Uploader } from './uploader'
+import type { RemoteSession } from './uploader'
+import type {
+  AiSessionSummary, AiTurn, SessionPayload, TodoItem, UncommittedFile, UnsavedFile,
+} from './types'
+
+/**
+ * 사이드바 뷰 — 지금 무엇이 서버로 갈지 보여 준다 (PRD X3, BACKLOG 1-14).
+ *
+ * <p>상태바는 "미커밋 파일 N개" 한 줄뿐이라, 무엇이 수집됐는지 확인하려면 전송한 뒤
+ * DB 나 대시보드를 봐야 했다. 이 뷰는 전송 전에 목록 그대로 보여 준다.
+ *
+ * <p>수집은 화면을 열거나 새로고침할 때만 한다. diff 본문은 화면에 쓰지 않으므로
+ * 받아 오지 않는다 — 저장소가 크면 diff 수집이 가장 무겁다.
+ */
+export class WorkLogTreeProvider implements vscode.TreeDataProvider<Node> {
+  private readonly changed = new vscode.EventEmitter<Node | undefined>()
+  readonly onDidChangeTreeData = this.changed.event
+
+  private payloads: SessionPayload[] = []
+  private status: Status = { kind: 'idle' }
+  private loading = false
+  /** 서버에 저장된 내역. 펼칠 때만 불러온다 — 열지도 않을 것을 1분마다 받아 올 이유가 없다. */
+  private history: History = { kind: 'idle' }
+
+  constructor(private readonly collector: Collector) {}
+
+  /** 전송 결과를 상태 줄에 반영한다. */
+  setStatus(status: Status): void {
+    this.status = status
+    this.changed.fire(undefined)
+  }
+
+  async refresh(): Promise<void> {
+    if (this.loading) return
+    this.loading = true
+    try {
+      this.payloads = await this.collector.collect(false)
+    } finally {
+      this.loading = false
+      this.changed.fire(undefined)
+    }
+  }
+
+  /**
+   * 서버에 저장된 내 최근 내역을 불러온다 (사이드바 하단).
+   *
+   * <p>지금까지 VS Code 안에서는 <b>보낸 것이 실제로 서버에 들어갔는지</b> 확인할 길이
+   * 없었다. 대시보드를 열어야 알 수 있었다. 펼칠 때만 부른다.
+   */
+  async loadHistory(config: { serverUrl: string; apiKey: string }): Promise<void> {
+    if (this.history.kind === 'loading') return
+    this.history = { kind: 'loading' }
+    this.changed.fire(undefined)
+
+    const to = todayKst()
+    const result = await new Uploader(config).fetchRecent(daysBefore(to, HISTORY_DAYS - 1), to)
+    this.history = result.ok
+      ? { kind: 'loaded', sessions: result.sessions }
+      : { kind: 'failed', reason: result.reason }
+    this.changed.fire(undefined)
+  }
+
+  getTreeItem(node: Node): vscode.TreeItem {
+    return node.item
+  }
+
+  getChildren(node?: Node): Node[] {
+    if (!node) return this.roots()
+    return node.children ?? []
+  }
+
+  private roots(): Node[] {
+    const nodes: Node[] = [
+      leaf(statusLabel(this.status), statusIcon(this.status)),
+      serverNode(this.status),
+    ]
+
+    if (this.payloads.length === 0) {
+      nodes.push(leaf('수집된 저장소 없음', 'info', '워크스페이스가 git 저장소가 아니거나 origin 이 없습니다'))
+      return nodes
+    }
+
+    const registered = cachedRegisteredRepos()
+    for (const p of this.payloads) {
+      const cwd = this.collector.folderOf(p)
+      const name = repoName(p.remoteUrl)
+
+      const children: Node[] = [planNode(this.collector.planOf(cwd), cwd)]
+      children.push(group(`미커밋 파일 ${p.uncommittedFiles.length}개`, 'diff', p.uncommittedFiles.map((f) => fileNode(f, cwd))))
+      children.push(unpushedGroup(this.collector.unpushedOf(p)))
+      children.push(aiGroup(p.aiSessions, cwd))
+      children.push(group(`TODO ${p.todos.length}개`, 'checklist', p.todos.map((t) => todoNode(t, cwd))))
+      children.push(
+        group(
+          `미저장 파일 ${p.unsavedFiles.length}개`,
+          'save',
+          p.unsavedFiles.map((f) => unsavedNode(f, cwd)),
+        ),
+      )
+
+      const repo = group(`${name} · ${p.branch}`, 'repo', children, true)
+      // 등록하지 않은 리포는 수집만 하고 보내지 않는다. 목록을 아직 못 읽었으면 아무 말도
+      // 하지 않는다 — "보내지 않음" 이라고 잘못 적으면 보낸 것을 안 보냈다고 읽게 된다.
+      if (registered && !registered.has(name.toLowerCase())) {
+        repo.item.description = '등록되지 않은 리포 · 보내지 않음'
+        repo.item.tooltip = `${name} 은(는) 설정 > 리포지터리에 등록되지 않았습니다.\n`
+          + '등록하기 전까지 이 폴더의 작업은 서버로 가지 않습니다.'
+        repo.item.iconPath = new vscode.ThemeIcon('circle-slash')
+      }
+      nodes.push(repo)
+    }
+
+    nodes.push(historyNode(this.history, this.payloads.map((p) => p.remoteUrl)))
+    return nodes
+  }
+}
+
+/** 서버 내역을 며칠치 보여 줄지. 확인용이라 길게 볼 이유가 없다. */
+const HISTORY_DAYS = 7
+
+type History =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'loaded'; sessions: RemoteSession[] }
+  | { kind: 'failed'; reason: string }
+
+/**
+ * "서버에 저장된 내역" — 위쪽 "오늘 보낼 내용" 과 달리 **서버가 들고 있는 것**이다.
+ *
+ * <p>둘을 섞지 않는다. 위는 아직 보내지 않았을 수 있는 지금 상태고, 여기는 서버가 받은
+ * 결과다. 보낸 것이 들어갔는지 확인하는 자리다.
+ */
+function historyNode(history: History, openRemotes: string[]): Node {
+  // 지금 열어 둔 저장소의 것만 본다. 다른 저장소 기록까지 섞이면 확인하려던 것이 묻힌다.
+  const mine = history.kind === 'loaded' ? ofOpenRepos(history.sessions, openRemotes) : []
+  const node: Node = group('서버에 저장된 내역', 'cloud', historyChildren(history, mine))
+  node.kind = 'history'
+  // 다시 그려도 펼친 상태가 유지되도록 id 를 고정한다.
+  node.item.id = 'worklog.history'
+  node.item.tooltip = `펼치면 서버에 저장된 최근 ${HISTORY_DAYS}일치 내 기록을 불러옵니다`
+  if (history.kind === 'loaded') {
+    // 머리글도 **걸러 낸 뒤**의 수다. 예전에는 받아 온 전체를 적어, 펼치면 다른 저장소를
+    // 뺀 목록이 나와 숫자와 맞지 않았다.
+    node.item.description = `최근 ${HISTORY_DAYS}일 · ${mine.length}건`
+  } else if (history.kind === 'failed') {
+    node.item.description = history.reason
+  }
+  return node
+}
+
+/** 지금 열어 둔 저장소의 기록만 고른다. 주소 모양(ssh·https)이 달라도 같은 저장소다. */
+function ofOpenRepos(sessions: RemoteSession[], openRemotes: string[]): RemoteSession[] {
+  const names = new Set(openRemotes.map(repoName))
+  return sessions.filter((s) => names.has(repoName(s.remoteUrl)))
+}
+
+function historyChildren(history: History, mine: RemoteSession[]): Node[] {
+  if (history.kind === 'idle') return [leaf('펼치면 불러옵니다', 'ellipsis')]
+  if (history.kind === 'loading') return [leaf('불러오는 중…', 'sync')]
+  if (history.kind === 'failed') {
+    return [leaf(history.reason, 'warning', '서버 주소와 API Key 를 확인하세요')]
+  }
+  if (mine.length === 0) {
+    return [leaf('이 저장소로 보낸 기록이 없습니다', 'info')]
+  }
+
+  const byDate = new Map<string, RemoteSession[]>()
+  for (const s of mine) byDate.set(s.workDate, [...(byDate.get(s.workDate) ?? []), s])
+
+  return [...byDate.entries()]
+    .sort((a, b) => b[0].localeCompare(a[0]))
+    .map(([workDate, sessions]) => {
+      const files = sessions.reduce((n, x) => n + x.uncommittedFiles.length, 0)
+      const day = group(
+        workDate,
+        'calendar',
+        sessions.map((s) => remoteSessionNode(s)),
+        workDate === todayKst(),
+      )
+      day.item.description = `브랜치 ${sessions.length} · 미커밋 파일 ${files}개`
+      return day
+    })
+}
+
+function remoteSessionNode(s: RemoteSession): Node {
+  const ai = s.aiSessions ?? []
+  const plan = (s.planNote ?? '').trim()
+  const children: Node[] = [
+    leaf(`미커밋 파일 ${s.uncommittedFiles.length}개`, 'diff'),
+    leaf(`TODO ${s.todos.length}개`, 'checklist'),
+    leaf(`미저장 파일 ${(s.unsavedFiles ?? []).length}개`, 'save'),
+    group('계획', 'note', planLines(plan)),
+    group(
+      `AI 대화 ${ai.length}세션`,
+      'comment-discussion',
+      ai.map((a) => leaf(a.title ?? a.id, 'comment', undefined, `${a.promptCount ?? 0}개`)),
+    ),
+  ]
+  const node = group(s.branch, 'git-branch', children)
+  node.item.description = `보고 ${time(s.reportedAt)}`
+  node.item.tooltip = `${s.repo?.fullName ?? s.remoteUrl} · ${s.branch}\n보고 ${s.reportedAt}`
+  return node
+}
+
+/** `iso` 에서 `days` 일 전의 YYYY-MM-DD. */
+function daysBefore(iso: string, days: number): string {
+  const [y, m, d] = iso.split('-').map(Number)
+  const t = new Date(y, m - 1, d - days)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`
+}
+
+/**
+ * 지금 부르고 있는 서버 주소. 누르면 그 자리에서 바꾼다.
+ *
+ * <p>서버는 한 대만 띄우고 여럿이 붙는 것이 이 도구의 쓰임인데 기본값은 `localhost` — 자기
+ * PC 다 (BACKLOG2 §2-1). 남의 PC 에서 열면 아무 말 없이 자기 컴퓨터를 부르고, 자기 백엔드를
+ * 띄워 두었다면 작업 기록이 그쪽 DB 로 들어가 갈린다. 무엇을 부르고 있는지 늘 보이게 둔다.
+ *
+ * <p>전송이 실패한 뒤에는 아이콘을 바꿔 둔다 — 실패의 첫 번째 용의자가 이 주소다.
+ */
+function serverNode(status: Status): Node {
+  const url = currentServerUrl()
+  const node = leaf(
+    `서버 ${url.replace(/^https?:\/\//, '').replace(/\/+$/, '')}`,
+    status.kind === 'failed' ? 'warning' : 'server',
+    `작업 기록을 이 주소로 보냅니다 — ${url}\n`
+      + '서버를 띄운 PC 가 따로 있으면 그 주소로 바꿉니다. 예) http://192.168.0.10:8080',
+    '눌러서 변경',
+  )
+  node.item.command = { command: 'worklog.setServerUrl', title: 'WorkLog: 서버 주소 설정' }
+  return node
+}
+
+/** extension.ts 의 readConfig 와 같은 값. 설정을 그때그때 읽어 바꾼 즉시 반영한다. */
+function currentServerUrl(): string {
+  const url = vscode.workspace.getConfiguration('worklog').get<string>('serverUrl', '').trim()
+  return url || 'http://localhost:8080'
+}
+
+export type Status =
+  | { kind: 'idle' }
+  | { kind: 'sent'; at: Date; files: number }
+  | { kind: 'failed'; at: Date; reason: string }
+
+function statusLabel(s: Status): string {
+  if (s.kind === 'idle') return '아직 전송하지 않음'
+  if (s.kind === 'sent') return `전송 완료 ${time(s.at.toISOString())} · 미커밋 파일 ${s.files}개`
+  return `전송 실패 ${time(s.at.toISOString())} · ${s.reason}`
+}
+
+function statusIcon(s: Status): string {
+  if (s.kind === 'sent') return 'check'
+  if (s.kind === 'failed') return 'warning'
+  return 'circle-outline'
+}
+
+interface Node {
+  item: vscode.TreeItem
+  children?: Node[]
+  /** 펼칠 때 무엇을 해야 하는지 가리는 표시. 지금은 서버 내역 하나뿐이다. */
+  kind?: 'history'
+}
+
+function leaf(label: string, icon: string, tooltip?: string, description?: string): Node {
+  const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None)
+  item.iconPath = new vscode.ThemeIcon(icon)
+  if (tooltip) item.tooltip = tooltip
+  if (description) item.description = description
+  return { item }
+}
+
+function group(label: string, icon: string, children: Node[], expanded = false): Node {
+  const state = children.length === 0
+    ? vscode.TreeItemCollapsibleState.None
+    : expanded
+      ? vscode.TreeItemCollapsibleState.Expanded
+      : vscode.TreeItemCollapsibleState.Collapsed
+  const item = new vscode.TreeItem(label, state)
+  item.iconPath = new vscode.ThemeIcon(icon)
+  return { item, children }
+}
+
+/**
+ * 아직 푸시하지 않은 커밋.
+ *
+ * <p>이 구간은 GitHub 수집기가 보지 못한다 — 원격에 없으니 API 로 안 나온다.
+ * 서버로도 보내지 않는다 (PRD 7 요청 본문에 자리가 없다). 여기서만 보인다.
+ */
+function unpushedGroup(commits: UnpushedCommit[] | undefined): Node {
+  if (commits === undefined) {
+    return leaf('미푸시 커밋 — 셀 수 없음', 'cloud', '업스트림이 없습니다. 한 번도 푸시하지 않은 브랜치입니다')
+  }
+  return group(
+    `미푸시 커밋 ${commits.length}개`,
+    'cloud-upload',
+    commits.map((c) => leaf(c.subject, 'git-commit', `${c.sha} · ${time(c.at)}`, c.sha)),
+  )
+}
+
+/**
+ * 오늘 계획 — <b>문서를 여는 한 줄</b>이다. 내용은 여기에 펼치지 않는다.
+ *
+ * <p>계획은 markdown 문서 한 통이라(하루에 하나), 트리에 줄 목록으로 옮기면 제목도
+ * 들여쓰기도 뭉개진 채 사이드바만 길어졌다. 제대로 읽으려면 어차피 문서를 열어야 했다.
+ * 그래서 <b>두 번 누르면 문서가 열린다</b> — 읽는 자리와 고치는 자리를 하나로 둔다.
+ * 한 번 누르는 것은 고르기다. 탐색기에서 파일을 여는 몸짓과 같게 뒀다.
+ *
+ * <p>적어 뒀을 때는 아무 표시도 붙이지 않는다. "적어 둠" 같은 꼬리표는 한 줄을 차지하면서
+ * 아무것도 알려 주지 않는다. <b>비었을 때만</b> 그렇다고 적는다.
+ *
+ * <p>건수도 세지 않는다. 한 줄이 계획 하나가 아니게 된 지금은 아무 뜻도 없는 숫자다.
+ */
+function planNode(plan: string, folder: string | undefined): Node & { folder?: string } {
+  const node = leaf(
+    '계획',
+    'note',
+    '두 번 누르면 오늘 계획 문서를 엽니다',
+    plan ? undefined : '미작성',
+  ) as Node & { folder?: string }
+  node.item.command = { command: 'worklog.planClicked', title: '계획 열기', arguments: [{ folder }] }
+  // 우클릭·연필(inline)로도 같은 자리에 닿는다.
+  node.item.contextValue = 'worklog.plan'
+  node.folder = folder
+  return node
+}
+
+/**
+ * 서버에 저장된 계획을 줄로 펴 놓는다.
+ *
+ * <p>여기만 남긴다. 위쪽 "오늘 보낼 내용" 과 달리 <b>열어 볼 문서가 없는</b> 기록이라,
+ * 펼쳐 보여 주지 않으면 무엇을 보냈는지 VS Code 안에서 확인할 길이 없다.
+ */
+function planLines(plan: string): Node[] {
+  return plan
+    .split('\n')
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim())
+    .map((l) => leaf(l, 'circle-small-filled', plan))
+}
+
+/**
+ * 이 폴더에서 오간 AI 대화 — 오늘 질문을 올린 것과 지금 열어 둔 것.
+ *
+ * <p>커밋에도 미커밋 변경에도 남지 않는 작업이다 — 무엇을 어떻게 할지 묻고 정한 과정.
+ * 여기 있는 것은 모두 서버로 간다. "보내지 않음" 으로 따로 붙이던 줄은 없앴다.
+ */
+function aiGroup(sessions: AiSessionSummary[], cwd: string | undefined): Node {
+  return group(
+    `AI 대화 ${sessions.length}세션`,
+    'comment-discussion',
+    sessions.map((s) => sessionNode(s, cwd)),
+  )
+}
+
+/** "9/10" */
+function day(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : `${d.getMonth() + 1}/${d.getDate()}`
+}
+
+/** 세션 하나. 시각만으로는 무슨 대화였는지 알 수 없어 제목을 앞에 세운다. */
+function sessionNode(s: AiSessionSummary, cwd: string | undefined): Node {
+  const node = group(s.title, 'comment', s.turns.map((t) => turnNode(t, s, cwd)))
+  // 열어 두기만 한 대화는 마지막으로 오간 것이 어제일 수 있다. 시각만 적으면 오늘로 읽힌다.
+  const when = day(s.lastAt) === day(new Date().toISOString()) ? '' : `${day(s.lastAt)} `
+  // 어느 도구에서 한 대화인지. Claude Code 는 적지 않는다 (sourceOfId 참고).
+  const from = sourceOfId(s.id)
+  const tool = from.key ? `${from.label} · ` : ''
+  // 담은 것은 12개까지지만 실제로 물어본 횟수를 보여 준다.
+  node.item.description = `${tool}${when}${time(s.firstAt)}–${time(s.lastAt)} · ${s.promptCount}개`
+  node.item.tooltip = s.turns.length < s.promptCount
+    ? `${s.title}\n\n${s.promptCount}개 중 최근 ${s.turns.length}개만 보냅니다`
+    : s.title
+  return node
+}
+
+/**
+ * 질문 하나. 누르면 그 대화를 읽을 수 있는 문서로 열고 이 질문 자리로 간다.
+ *
+ * <p>예전에는 답변을 자식 노드로 달았다. 트리 한 줄에 답변 전문을 넣는 것이라 줄바꿈도
+ * 코드 블록도 사라지고 뒷부분은 잘렸다 — 답을 읽을 수 있는 모양이 아니었다. 답변은 문서에
+ * 있고, 여기서는 <b>어디를 볼지 고르는 것</b>만 한다.
+ */
+function turnNode(turn: AiTurn, session: AiSessionSummary, cwd: string | undefined): Node {
+  const node = leaf(turn.prompt, 'quote')
+  node.item.description = time(turn.at)
+  node.item.tooltip = `${turn.prompt}\n\n누르면 이 질문이 있는 대화를 엽니다`
+  if (cwd) {
+    node.item.command = {
+      command: 'worklog.openAiTurn',
+      title: '대화 열기',
+      arguments: [{ cwd, id: session.id, title: session.title, at: turn.at }],
+    }
+  }
+  return node
+}
+
+/** 파일 노드는 누르면 열린다. 새 파일은 diff 대신 본문이 가므로 표시를 나눈다. */
+function fileNode(f: UncommittedFile, cwd: string | undefined): Node {
+  const node = leaf(path.basename(f.path), 'file', `${f.path}\n\n두 번 누르면 엽니다`, `+${f.additions} −${f.deletions}`)
+  node.item.resourceUri = cwd ? vscode.Uri.file(path.join(cwd, f.path)) : undefined
+  openOnDoubleClick(node)
+  return node
+}
+
+/**
+ * 고쳐 놓고 저장하지 않은 파일. 누르면 열린다.
+ *
+ * <p>git 에 잡히지 않는 유일한 구간이라 여기서 보이지 않으면 어디에서도 안 보인다 —
+ * 저장하지 않은 내용은 디스크에 없어 diff 에도 없다.
+ */
+function unsavedNode(f: UnsavedFile, cwd: string | undefined): Node {
+  const node = leaf(path.basename(f.path), 'circle-filled', `${f.path}\n\n두 번 누르면 엽니다`, sinceLabel(f.dirtySince))
+  node.item.resourceUri = cwd ? vscode.Uri.file(path.join(cwd, f.path)) : undefined
+  openOnDoubleClick(node)
+  return node
+}
+
+/** 두 번 눌렀을 때만 열리게 한다. 한 번에 열면 목록을 훑기만 해도 편집기가 갈아엎어진다. */
+function openOnDoubleClick(node: Node, line?: number): void {
+  const uri = node.item.resourceUri
+  if (!uri) return
+  node.item.command = { command: 'worklog.openFile', title: '열기', arguments: [{ uri, line }] }
+}
+
+/** "12분째" — 언제부터 저장하지 않았는지. 확장을 다시 켠 뒤라 모르면 비운다. */
+function sinceLabel(iso: string | undefined): string | undefined {
+  if (!iso) return undefined
+  const minutes = Math.floor((Date.now() - new Date(iso).getTime()) / 60000)
+  if (Number.isNaN(minutes) || minutes < 1) return '방금'
+  if (minutes < 60) return `${minutes}분째`
+  return `${Math.floor(minutes / 60)}시간 ${minutes % 60}분째`
+}
+
+function todoNode(t: TodoItem, cwd: string | undefined): Node {
+  const node = leaf(
+    t.text,
+    'checklist',
+    `${t.path}:${t.line}\n\n두 번 누르면 그 줄로 엽니다`,
+    `${path.basename(t.path)}:${t.line}`,
+  )
+  node.item.resourceUri = cwd ? vscode.Uri.file(path.join(cwd, t.path)) : undefined
+  openOnDoubleClick(node, t.line)
+  return node
+}
+
+/** origin URL 에서 owner/repo 만. 전송 쪽과 같은 규칙을 써야 등록 여부 판정이 어긋나지 않는다. */
+const repoName = repoFullName
+
+function time(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toTimeString().slice(0, 8)
+}
