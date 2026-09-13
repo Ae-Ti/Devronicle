@@ -23,11 +23,25 @@ GitHub 커밋만으로는 보이지 않는 **진행 중인 일**이 업무 일�
 
 ## 설치
 
-1. `.vsix` 파일을 받는다 — [GitHub 릴리스](https://github.com/Ae-Ti/Devronicle/releases) 의
-   `worklog-drafter-<버전>.vsix`, 또는 `npm run package` 로 직접 만든 파일.
-2. VS Code → 확장 패널 → 우상단 `⋯` → **Install from VSIX…** → 파일 선택.
-   - 터미널을 선호하면: `code --install-extension worklog-drafter-<버전>.vsix`
-3. VS Code 를 다시 시작한다.
+빌드해 둔 파일이 저장소 안에 있다. 받아서 바로 깔면 된다.
+
+```bash
+code --install-extension release/worklog-drafter-0.5.0.vsix
+```
+
+터미널이 싫으면 VS Code → 확장 패널 → 우상단 `⋯` → **Install from VSIX…** → 그 파일을
+고른다. 깐 뒤 편집기를 다시 시작한다. Cursor 처럼 VS Code 계열 편집기도 같은 파일로 깔린다.
+
+직접 빌드하려면 (Node 20+):
+
+```bash
+npm install
+npm run package        # worklog-drafter-<버전>.vsix 를 만든다
+npm test               # 파서·수집·연결 코드 시험. 편집기 없이 돈다
+```
+
+> `release/` 에 둔 파일은 `npm run package` 가 만든 것과 같다. 저장소에 하나 넣어 둔 것은
+> 받는 사람이 Node 를 깔지 않고도 써 볼 수 있게 하기 위해서다.
 
 ## 최초 설정
 

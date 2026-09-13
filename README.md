@@ -90,26 +90,31 @@ JPA 는 `ddl-auto: validate` 라 엔티티와 스키마가 어긋나면 기동 �
 
 ## VS Code 확장 설치
 
-배포용 `.vsix` 를 만들고 설치하는 경로다. 확장 자체의 사용법·설정·문제 해결은
-[vscode-extension/README.md](vscode-extension/README.md) 에 있다.
+확장 자체의 사용법·설정·문제 해결은 [vscode-extension/README.md](vscode-extension/README.md) 에 있다.
+
+**빌드해 둔 파일이 저장소에 있다.** Node 도 빌드도 필요 없다.
+
+```bash
+code --install-extension vscode-extension/release/worklog-drafter-0.5.0.vsix
+```
+
+또는 VS Code → 확장 패널 → 우상단 `⋯` → **Install from VSIX…** → 그 파일을 고른다.
+Cursor 등 VS Code 계열 편집기도 같은 파일로 깔린다.
+
+직접 빌드하려면:
 
 ```bash
 cd vscode-extension
 npm install
 npm run package        # worklog-drafter-<버전>.vsix 생성
+npm test               # 파서·수집·연결 코드 시험 (편집기 없이 돈다)
 ```
 
-설치는 둘 중 하나로 한다.
-
-```bash
-code --install-extension worklog-drafter-<버전>.vsix
-```
-
-또는 VS Code → 확장 패널 → 우상단 `⋯` → **Install from VSIX…**.
-
-설치 후 **API Key 를 넣어야 전송이 된다.** 대시보드 → 설정 → API Key 발급 →
-VS Code 설정(`Cmd+,`)에서 `worklog` 검색 → **Api Key** 에 붙여넣는다.
-키가 없으면 상태바에 `WorkLog: API Key 미설정` 이 뜨고, 클릭하면 설정 화면으로 안내한다.
+설치 뒤 **연결은 대시보드가 한다.** 옮겨 적을 것은 없다 — 대시보드 → 설정 →
+API 연동 → **새 키 발급** → **`VS Code 에 연결`** 을 누르면 서버 주소와 개인 키가
+확장에 함께 들어가고, 곧바로 한 번 보내 연결까지 확인한다. 링크가 열리지 않는
+자리(원격 접속·브라우저가 막는 경우)는 같은 창의 **`연결 코드 복사`** → 편집기
+명령 팔레트 → `WorkLog: 대시보드 연결` 에 붙여 넣는다.
 
 ## 브랜치
 

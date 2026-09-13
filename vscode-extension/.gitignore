@@ -1,3 +1,5 @@
 node_modules/
 out/
 *.vsix
+# 빌드한 확장을 저장소에 하나 둔다 — 받는 사람이 Node 없이 바로 깔 수 있게.
+!release/*.vsix
